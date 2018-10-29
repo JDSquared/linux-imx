@@ -9,7 +9,7 @@
 /dts-v1/;
 
 #include "imx7d.dtsi"
-#include "imx7d-var-som-jd2-cb.dtsi"
+#include "imx7d-jd2-ethcb-var-som.dtsi"
 
 / {
 	model = "Variscite i.MX7 DUAL Smart Device Board";

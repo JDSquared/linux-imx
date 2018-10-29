@@ -602,6 +602,7 @@ dtb-$(CONFIG_SOC_IMX7D) += \
 	imx7d-sdb-reva-touch.dtb \
 	imx7d-sdb-reva-wm8960.dtb \
 	imx7d-sdb-reva-wm8960.dtb \
+	imx7d-jd2-ethcb-var-som.dtb \
 	imx7d-var-som-emmc.dtb \
 	imx7d-var-som-nand.dtb \
 	imx7d-var-som-emmc-m4.dtb \
