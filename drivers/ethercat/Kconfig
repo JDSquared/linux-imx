@@ -1,0 +1,27 @@
+menuconfig ETHERCAT
+	tristate "Ethercat support"
+	depends on NET
+	depends on INET
+	---help---
+	  IGH Ethercat master support.
+
+if ETHERCAT
+
+config ETHERCAT_EOE
+	bool "Ethercat Ethernet over Ethercat Support"
+	depends on ETHERCAT
+	default y
+
+config ETHERCAT_HRTIMER
+	bool "Ethercat master use high resolution timer"
+	depends on ETHERCAT && HIGH_RES_TIMERS
+	default y
+
+config ETHERCAT_DEBUG_IF
+	bool "Ethercat master debug interface"
+	depends on ETHERCAT
+	default n
+
+source "drivers/ethercat/devices/Kconfig"
+
+endif # ETHERCAT

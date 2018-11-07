@@ -1,0 +1,4 @@
+config ETHERCAT_DEV_GENERIC
+	tristate "Ethercat generic network device driver"
+	---help---
+	  This is an ethercat compatible generic network device driver.
