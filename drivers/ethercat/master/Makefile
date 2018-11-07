@@ -14,6 +14,7 @@ ec_master-y := \
 	fsm_coe.o \
 	fsm_eoe.o \
 	fsm_foe.o \
+	fsm_reboot.o \
 	fsm_master.o \
 	fsm_pdo.o \
 	fsm_pdo_entry.o \
@@ -35,11 +36,13 @@ ec_master-y := \
 	sdo_request.o \
 	slave.o \
 	slave_config.o \
+	sii_firmware.o \
 	soe_errors.o \
 	soe_request.o \
 	sync.o \
 	sync_config.o \
-	voe_handler.o
+	voe_handler.o \
+	dict_request.o
 
 ec_master-$(CONFIG_ETHERCAT_EOE) += ethernet.o
 ccflags-$(CONFIG_ETHERCAT_EOE) += -DEC_EOE
