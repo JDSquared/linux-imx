@@ -49,10 +49,15 @@
 #include "slave_config.h"
 #include "device.h"
 #include "datagram.h"
+#include "mailbox.h"
 #ifdef EC_EOE
 #include "ethernet.h"
 #endif
 #include "master.h"
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)
+#include <linux/sched/signal.h>
+#include <uapi/linux/sched/types.h>
+#endif
 
 /*****************************************************************************/
 
@@ -145,7 +150,7 @@ int ec_master_init(ec_master_t *master, /**< EtherCAT master */
     master->index = index;
     master->reserved = 0;
 
-    sema_init(&master->master_sem, 1);
+    ec_lock_init(&master->master_sem);
 
     for (dev_idx = EC_DEVICE_MAIN; dev_idx < EC_MAX_NUM_DEVICES; dev_idx++) {
         master->macs[dev_idx] = NULL;
@@ -164,41 +169,46 @@ int ec_master_init(ec_master_t *master, /**< EtherCAT master */
 
     ec_master_clear_device_stats(master);
 
-    sema_init(&master->device_sem, 1);
+    ec_lock_init(&master->device_sem);
 
     master->phase = EC_ORPHANED;
     master->active = 0;
     master->config_changed = 0;
     master->injection_seq_fsm = 0;
     master->injection_seq_rt = 0;
+    master->reboot = 0;
 
     master->slaves = NULL;
     master->slave_count = 0;
 
     INIT_LIST_HEAD(&master->configs);
     INIT_LIST_HEAD(&master->domains);
+    INIT_LIST_HEAD(&master->sii_images);
 
     master->app_time = 0ULL;
     master->app_start_time = 0ULL;
     master->has_app_time = 0;
+    master->dc_offset_valid = 0;
 
     master->scan_busy = 0;
     master->allow_scan = 1;
-    sema_init(&master->scan_sem, 1);
+    ec_lock_init(&master->scan_sem);
     init_waitqueue_head(&master->scan_queue);
 
     master->config_busy = 0;
-    sema_init(&master->config_sem, 1);
+    ec_lock_init(&master->config_sem);
     init_waitqueue_head(&master->config_queue);
 
     INIT_LIST_HEAD(&master->datagram_queue);
     master->datagram_index = 0;
 
     INIT_LIST_HEAD(&master->ext_datagram_queue);
-    sema_init(&master->ext_queue_sem, 1);
+    ec_lock_init(&master->ext_queue_sem);
 
     master->ext_ring_idx_rt = 0;
     master->ext_ring_idx_fsm = 0;
+    master->rt_slave_requests = 0;
+    master->rt_slaves_available = 0;
 
     // init external datagram ring
     for (i = 0; i < EC_EXT_RING_SIZE; i++) {
@@ -227,7 +237,7 @@ int ec_master_init(ec_master_t *master, /**< EtherCAT master */
     INIT_LIST_HEAD(&master->eoe_handlers);
 #endif
 
-    sema_init(&master->io_sem, 1);
+    ec_lock_init(&master->io_sem);
     master->send_cb = NULL;
     master->receive_cb = NULL;
     master->cb_data = NULL;
@@ -296,6 +306,17 @@ int ec_master_init(ec_master_t *master, /**< EtherCAT master */
         goto out_clear_ref_sync;
     }
 
+    // init sync64 datagram
+    ec_datagram_init(&master->sync64_datagram);
+    snprintf(master->sync64_datagram.name, EC_DATAGRAM_NAME_SIZE, "sync64");
+    ret = ec_datagram_prealloc(&master->sync64_datagram, 8);
+    if (ret < 0) {
+        ec_datagram_clear(&master->sync_datagram);
+        EC_MASTER_ERR(master, "Failed to allocate 64bit ref slave"
+                " system clock datagram.\n");
+        goto out_clear_sync;
+    }
+
     // init sync monitor datagram
     ec_datagram_init(&master->sync_mon_datagram);
     snprintf(master->sync_mon_datagram.name, EC_DATAGRAM_NAME_SIZE,
@@ -305,7 +326,7 @@ int ec_master_init(ec_master_t *master, /**< EtherCAT master */
         ec_datagram_clear(&master->sync_mon_datagram);
         EC_MASTER_ERR(master, "Failed to allocate sync"
                 " monitoring datagram.\n");
-        goto out_clear_sync;
+        goto out_clear_sync64;
     }
 
     master->dc_ref_config = NULL;
@@ -361,6 +382,8 @@ out_clear_cdev:
     ec_cdev_clear(&master->cdev);
 out_clear_sync_mon:
     ec_datagram_clear(&master->sync_mon_datagram);
+out_clear_sync64:
+    ec_datagram_clear(&master->sync64_datagram);
 out_clear_sync:
     ec_datagram_clear(&master->sync_datagram);
 out_clear_ref_sync:
@@ -400,14 +423,17 @@ void ec_master_clear(
 
     ec_cdev_clear(&master->cdev);
 
+    ec_master_slaves_not_available(master);
 #ifdef EC_EOE
     ec_master_clear_eoe_handlers(master);
 #endif
     ec_master_clear_domains(master);
     ec_master_clear_slave_configs(master);
     ec_master_clear_slaves(master);
+    ec_master_clear_sii_images(master);
 
     ec_datagram_clear(&master->sync_mon_datagram);
+    ec_datagram_clear(&master->sync64_datagram);
     ec_datagram_clear(&master->sync_datagram);
     ec_datagram_clear(&master->ref_sync_datagram);
 
@@ -452,13 +478,92 @@ void ec_master_clear_slave_configs(ec_master_t *master)
     ec_slave_config_t *sc, *next;
 
     master->dc_ref_config = NULL;
-    master->fsm.sdo_request = NULL; // mark sdo_request as invalid
 
     list_for_each_entry_safe(sc, next, &master->configs, list) {
         list_del(&sc->list);
         ec_slave_config_clear(sc);
         kfree(sc);
     }
+}
+
+/*****************************************************************************/
+
+/** Clear the SII data.
+ */
+void ec_sii_image_clear(ec_sii_image_t *sii_image)
+{
+    unsigned int i;
+    ec_pdo_t *pdo, *next_pdo;
+
+    // free all sync managers
+    if (sii_image->sii.syncs) {
+        for (i = 0; i < sii_image->sii.sync_count; i++) {
+            ec_sync_clear(&sii_image->sii.syncs[i]);
+        }
+        kfree(sii_image->sii.syncs);
+        sii_image->sii.syncs = NULL;
+    }
+
+    // free all strings
+    if (sii_image->sii.strings) {
+        for (i = 0; i < sii_image->sii.string_count; i++)
+            kfree(sii_image->sii.strings[i]);
+        kfree(sii_image->sii.strings);
+    }
+
+    // free all SII PDOs
+    list_for_each_entry_safe(pdo, next_pdo, &sii_image->sii.pdos, list) {
+        list_del(&pdo->list);
+        ec_pdo_clear(pdo);
+        kfree(pdo);
+    }
+
+    if (sii_image->words) {
+        kfree(sii_image->words);
+    }
+}
+
+/*****************************************************************************/
+
+/** Clear the SII data applied during bus scanning.
+ */
+void ec_master_clear_sii_images(
+        ec_master_t *master /**< EtherCAT master. */
+        )
+{
+    ec_sii_image_t *sii_image, *next;
+
+    list_for_each_entry_safe(sii_image, next, &master->sii_images, list) {
+#ifdef EC_SII_CACHE
+        if ((master->phase != EC_OPERATION) ||
+           ((sii_image->sii.serial_number == 0) && (sii_image->sii.alias == 0)))
+#endif
+        {
+            list_del(&sii_image->list);
+            ec_sii_image_clear(sii_image);
+            kfree(sii_image);
+        }
+    }
+}
+
+/*****************************************************************************/
+
+/** Set flag to say that the slaves are not available for slave request
+ * processing.
+ */
+void ec_master_slaves_not_available(ec_master_t *master)
+{
+    master->rt_slaves_available = 0;
+}
+
+/*****************************************************************************/
+
+/** Set flag to say that the slaves are now available for slave request
+ * processing.
+ */
+void ec_master_slaves_available(ec_master_t *master)
+{
+    master->rt_slaves_available = 1;
 }
 
 /*****************************************************************************/
@@ -479,8 +584,9 @@ void ec_master_clear_slaves(ec_master_t *master)
             list_entry(master->sii_requests.next,
                     ec_sii_write_request_t, list);
         list_del_init(&request->list); // dequeue
-        EC_MASTER_WARN(master, "Discarding SII request, slave %u about"
-                " to be deleted.\n", request->slave->ring_position);
+        EC_MASTER_WARN(master, "Discarding SII request, slave %s-%u about"
+                " to be deleted.\n", ec_device_names[request->slave->device_index!=0],
+                request->slave->ring_position);
         request->state = EC_INT_REQUEST_FAILURE;
         wake_up_all(&master->request_queue);
     }
@@ -526,10 +632,10 @@ void ec_master_clear_config(
         ec_master_t *master /**< EtherCAT master. */
         )
 {
-    down(&master->master_sem);
+    ec_lock_down(&master->master_sem);
     ec_master_clear_domains(master);
     ec_master_clear_slave_configs(master);
-    up(&master->master_sem);
+    ec_lock_up(&master->master_sem);
 }
 
 /*****************************************************************************/
@@ -541,9 +647,9 @@ void ec_master_internal_send_cb(
         )
 {
     ec_master_t *master = (ec_master_t *) cb_data;
-    down(&master->io_sem);
+    ec_lock_down(&master->io_sem);
     ecrt_master_send_ext(master);
-    up(&master->io_sem);
+    ec_lock_up(&master->io_sem);
 }
 
 /*****************************************************************************/
@@ -555,9 +661,9 @@ void ec_master_internal_receive_cb(
         )
 {
     ec_master_t *master = (ec_master_t *) cb_data;
-    down(&master->io_sem);
+    ec_lock_down(&master->io_sem);
     ecrt_master_receive(master);
-    up(&master->io_sem);
+    ec_lock_up(&master->io_sem);
 }
 
 /*****************************************************************************/
@@ -661,14 +767,16 @@ void ec_master_leave_idle_phase(ec_master_t *master /**< EtherCAT master */)
 
     master->phase = EC_ORPHANED;
 
+    ec_master_slaves_not_available(master);
 #ifdef EC_EOE
     ec_master_eoe_stop(master);
 #endif
     ec_master_thread_stop(master);
 
-    down(&master->master_sem);
+    ec_lock_down(&master->master_sem);
     ec_master_clear_slaves(master);
-    up(&master->master_sem);
+    ec_master_clear_sii_images(master);
+    ec_lock_up(&master->master_sem);
 
     ec_fsm_master_reset(&master->fsm);
 }
@@ -688,9 +796,9 @@ int ec_master_enter_operation_phase(
 
     EC_MASTER_DBG(master, 1, "IDLE -> OPERATION.\n");
 
-    down(&master->config_sem);
+    ec_lock_down(&master->config_sem);
     if (master->config_busy) {
-        up(&master->config_sem);
+        ec_lock_up(&master->config_sem);
 
         // wait for slave configuration to complete
         ret = wait_event_interruptible(master->config_queue,
@@ -704,15 +812,15 @@ int ec_master_enter_operation_phase(
         EC_MASTER_DBG(master, 1, "Waiting for pending slave"
                 " configuration returned.\n");
     } else {
-        up(&master->config_sem);
+        ec_lock_up(&master->config_sem);
     }
 
-    down(&master->scan_sem);
+    ec_lock_down(&master->scan_sem);
     master->allow_scan = 0; // 'lock' the slave list
     if (!master->scan_busy) {
-        up(&master->scan_sem);
+        ec_lock_up(&master->scan_sem);
     } else {
-        up(&master->scan_sem);
+        ec_lock_up(&master->scan_sem);
 
         // wait for slave scan to complete
         ret = wait_event_interruptible(master->scan_queue,
@@ -899,6 +1007,17 @@ void ec_master_set_send_interval(
 
 /*****************************************************************************/
 
+/** Requests that all slaves on this master be rebooted (if supported).
+ */
+void ec_master_reboot_slaves(
+        ec_master_t *master /**< EtherCAT master */
+        )
+{
+    master->reboot = 1;
+}
+
+/*****************************************************************************/
+
 /** Searches for a free datagram in the external datagram ring.
  *
  * \return Next free datagram, or NULL.
@@ -911,6 +1030,12 @@ ec_datagram_t *ec_master_get_external_datagram(
             master->ext_ring_idx_rt) {
         ec_datagram_t *datagram =
             &master->ext_datagram_ring[master->ext_ring_idx_fsm];
+        /* Record the queued time for ec_master_inject_external_datagrams */
+#ifdef EC_HAVE_CYCLES
+        datagram->cycles_sent = get_cycles();
+#endif
+        datagram->jiffies_sent = jiffies;
+
         return datagram;
     }
     else {
@@ -947,8 +1072,10 @@ void ec_master_queue_datagram(
         }
     }
 
-    list_add_tail(&datagram->queue, &master->datagram_queue);
-    datagram->state = EC_DATAGRAM_QUEUED;
+    if (datagram->state != EC_DATAGRAM_INVALID) {
+        list_add_tail(&datagram->queue, &master->datagram_queue);
+        datagram->state = EC_DATAGRAM_QUEUED;
+    }
 }
 
 /*****************************************************************************/
@@ -960,12 +1087,21 @@ void ec_master_queue_datagram_ext(
         ec_datagram_t *datagram /**< datagram */
         )
 {
-    down(&master->ext_queue_sem);
+    ec_lock_down(&master->ext_queue_sem);
     list_add_tail(&datagram->queue, &master->ext_datagram_queue);
-    up(&master->ext_queue_sem);
+    ec_lock_up(&master->ext_queue_sem);
 }
 
 /*****************************************************************************/
+
+static int index_in_use(ec_master_t *master, uint8_t index)
+{
+    ec_datagram_t *datagram;
+    list_for_each_entry(datagram, &master->datagram_queue, queue)
+        if (datagram->state == EC_DATAGRAM_SENT && datagram->index == index)
+            return 1;
+    return 0;
+}
 
 /** Sends the datagrams in the queue for a certain device.
  *
@@ -986,6 +1122,7 @@ size_t ec_master_send_datagrams(
     unsigned int frame_count, more_datagrams_waiting;
     struct list_head sent_datagrams;
     size_t sent_bytes = 0;
+    uint8_t last_index;
 
 #ifdef EC_HAVE_CYCLES
     cycles_start = get_cycles();
@@ -1023,8 +1160,18 @@ size_t ec_master_send_datagrams(
                 break;
             }
 
-            list_add_tail(&datagram->sent, &sent_datagrams);
+            // do not reuse the index of a pending datagram to avoid confusion
+            // in ec_master_receive_datagrams()
+            last_index = master->datagram_index;
+            while (index_in_use(master, master->datagram_index)) {
+                if (++master->datagram_index == last_index) {
+                    EC_MASTER_ERR(master, "No free datagram index, sending delayed\n");
+                    goto break_send;
+                }
+            }
             datagram->index = master->datagram_index++;
+
+            list_add_tail(&datagram->sent, &sent_datagrams);
 
             EC_MASTER_DBG(master, 2, "Adding datagram 0x%02X\n",
                     datagram->index);
@@ -1053,6 +1200,7 @@ size_t ec_master_send_datagrams(
             cur_data += EC_DATAGRAM_FOOTER_SIZE;
         }
 
+break_send:
         if (list_empty(&sent_datagrams)) {
             EC_MASTER_DBG(master, 2, "nothing to send.\n");
             break;
@@ -1085,6 +1233,7 @@ size_t ec_master_send_datagrams(
             datagram->cycles_sent = cycles_sent;
 #endif
             datagram->jiffies_sent = jiffies_sent;
+            datagram->app_time_sent = master->app_time;
             list_del_init(&datagram->sent); // empty list of sent datagrams
         }
 
@@ -1119,10 +1268,11 @@ void ec_master_receive_datagrams(
         )
 {
     size_t frame_size, data_size;
-    uint8_t datagram_type, datagram_index;
-    unsigned int cmd_follows, matched;
+    uint8_t datagram_type, datagram_index, datagram_mbox_prot;
+    unsigned int cmd_follows, datagram_slave_addr, datagram_offset_addr, datagram_wc, matched;
     const uint8_t *cur_data;
     ec_datagram_t *datagram;
+    ec_slave_t *slave;
 
     if (unlikely(size < EC_FRAME_HEADER_SIZE)) {
         if (master->debug_level || FORCE_OUTPUT_CORRUPTED) {
@@ -1164,6 +1314,8 @@ void ec_master_receive_datagrams(
         // process datagram header
         datagram_type  = EC_READ_U8 (cur_data);
         datagram_index = EC_READ_U8 (cur_data + 1);
+        datagram_slave_addr  = EC_READ_U16(cur_data + 2);
+        datagram_offset_addr = EC_READ_U16(cur_data + 4);
         data_size      = EC_READ_U16(cur_data + 6) & 0x07FF;
         cmd_follows    = EC_READ_U16(cur_data + 6) & 0x8000;
         cur_data += EC_DATAGRAM_HEADER_SIZE;
@@ -1220,9 +1372,89 @@ void ec_master_receive_datagrams(
                 datagram->type != EC_DATAGRAM_FPWR &&
                 datagram->type != EC_DATAGRAM_BWR &&
                 datagram->type != EC_DATAGRAM_LWR) {
-            // copy received data into the datagram memory,
-            // if something has been read
-            memcpy(datagram->data, cur_data, data_size);
+
+            // common mailbox dispatcher for mailboxes read using the physical slave address
+            if (datagram->type == EC_DATAGRAM_FPRD) {
+                datagram_wc = EC_READ_U16(cur_data + data_size);
+                if (datagram_wc) {
+                    if (master->slaves != NULL) {
+                        for (slave = master->slaves; slave < master->slaves + master->slave_count; slave++) {
+                            if (slave->station_address == datagram_slave_addr) {
+                                break;
+                            }
+                        }
+                        if (slave->station_address == datagram_slave_addr) {
+                            if (slave->configured_tx_mailbox_offset != 0) {
+                                if (datagram_offset_addr == slave->configured_tx_mailbox_offset) {
+                                    if (slave->valid_mbox_data) {
+                                        datagram_mbox_prot = EC_READ_U8(cur_data + 5) & 0x0F;
+                                        switch (datagram_mbox_prot) {
+#ifdef EC_EOE
+                                        case EC_MBOX_TYPE_EOE:
+                                            if ((slave->mbox_eoe_data.data) && (data_size <= slave->mbox_eoe_data.data_size)) {
+                                                memcpy(slave->mbox_eoe_data.data, cur_data, data_size);
+                                                slave->mbox_eoe_data.payload_size = data_size;
+                                            }
+                                            break;
+#endif
+                                        case EC_MBOX_TYPE_COE:
+                                            if ((slave->mbox_coe_data.data) && (data_size <= slave->mbox_coe_data.data_size)) {
+                                                memcpy(slave->mbox_coe_data.data, cur_data, data_size);
+                                                slave->mbox_coe_data.payload_size = data_size;
+                                            }
+                                            break;
+                                        case EC_MBOX_TYPE_FOE:
+                                            if ((slave->mbox_foe_data.data) && (data_size <= slave->mbox_foe_data.data_size)) {
+                                                memcpy(slave->mbox_foe_data.data, cur_data, data_size);
+                                                slave->mbox_foe_data.payload_size = data_size;
+                                            }
+                                            break;
+                                        case EC_MBOX_TYPE_SOE:
+                                            if ((slave->mbox_soe_data.data) && (data_size <= slave->mbox_soe_data.data_size)) {
+                                                memcpy(slave->mbox_soe_data.data, cur_data, data_size);
+                                                slave->mbox_soe_data.payload_size = data_size;
+                                            }
+                                            break;
+                                        case EC_MBOX_TYPE_VOE:
+                                            if ((slave->mbox_voe_data.data) && (data_size <= slave->mbox_voe_data.data_size)) {
+                                                memcpy(slave->mbox_voe_data.data, cur_data, data_size);
+                                                slave->mbox_voe_data.payload_size = data_size;
+                                            }
+                                            break;
+                                        default:
+                                            EC_MASTER_DBG(master, 1, "Unknown mailbox protocol from slave: %u Protocol: %u\n", datagram_slave_addr, datagram_mbox_prot);
+                                            // copy instead received data into the datagram memory.
+                                            memcpy(datagram->data, cur_data, data_size);
+                                            break;
+                                        }
+                                    } else {
+                                        // copy instead received data into the datagram memory.
+                                        memcpy(datagram->data, cur_data, data_size);
+                                    }
+                                } else {
+                                    // copy instead received data into the datagram memory.
+                                    memcpy(datagram->data, cur_data, data_size);
+                                }
+                            } else {
+                                // copy instead received data into the datagram memory.
+                                memcpy(datagram->data, cur_data, data_size);
+                            }
+                        } else {
+                            EC_MASTER_DBG(master, 1, "No slave matching datagram slave address: %u\n", datagram_slave_addr);
+                        }
+                    } else {
+                        EC_MASTER_DBG(master, 1, "No configured slaves!\n");
+                        // copy instead received data into the datagram memory.
+                        memcpy(datagram->data, cur_data, data_size);
+                    }
+                } else {
+                    // copy instead received data into the datagram memory.
+                    memcpy(datagram->data, cur_data, data_size);
+                }
+            } else {
+                // copy instead received data into the datagram memory.
+                memcpy(datagram->data, cur_data, data_size);
+            }
         }
         cur_data += data_size;
 
@@ -1230,14 +1462,17 @@ void ec_master_receive_datagrams(
         datagram->working_counter = EC_READ_U16(cur_data);
         cur_data += EC_DATAGRAM_FOOTER_SIZE;
 
-        // dequeue the received datagram
-        datagram->state = EC_DATAGRAM_RECEIVED;
 #ifdef EC_HAVE_CYCLES
         datagram->cycles_received =
             master->devices[EC_DEVICE_MAIN].cycles_poll;
 #endif
         datagram->jiffies_received =
             master->devices[EC_DEVICE_MAIN].jiffies_poll;
+
+        barrier(); /* reordering might lead to races */
+
+        // dequeue the received datagram
+        datagram->state = EC_DATAGRAM_RECEIVED;
         list_del_init(&datagram->queue);
     }
 }
@@ -1252,25 +1487,26 @@ void ec_master_receive_datagrams(
 void ec_master_output_stats(ec_master_t *master /**< EtherCAT master */)
 {
     if (unlikely(jiffies - master->stats.output_jiffies >= HZ)) {
-        master->stats.output_jiffies = jiffies;
-
-        if (master->stats.timeouts) {
-            EC_MASTER_WARN(master, "%u datagram%s TIMED OUT!\n",
-                    master->stats.timeouts,
-                    master->stats.timeouts == 1 ? "" : "s");
-            master->stats.timeouts = 0;
-        }
-        if (master->stats.corrupted) {
-            EC_MASTER_WARN(master, "%u frame%s CORRUPTED!\n",
-                    master->stats.corrupted,
-                    master->stats.corrupted == 1 ? "" : "s");
-            master->stats.corrupted = 0;
-        }
-        if (master->stats.unmatched) {
-            EC_MASTER_WARN(master, "%u datagram%s UNMATCHED!\n",
-                    master->stats.unmatched,
-                    master->stats.unmatched == 1 ? "" : "s");
-            master->stats.unmatched = 0;
+        if (!master->scan_busy || (master->debug_level > 0)) {
+            master->stats.output_jiffies = jiffies;
+            if (master->stats.timeouts) {
+                EC_MASTER_WARN(master, "%u datagram%s TIMED OUT!\n",
+                        master->stats.timeouts,
+                        master->stats.timeouts == 1 ? "" : "s");
+                master->stats.timeouts = 0;
+            }
+            if (master->stats.corrupted) {
+                EC_MASTER_WARN(master, "%u frame%s CORRUPTED!\n",
+                        master->stats.corrupted,
+                        master->stats.corrupted == 1 ? "" : "s");
+                master->stats.corrupted = 0;
+            }
+            if (master->stats.unmatched) {
+                EC_MASTER_WARN(master, "%u datagram%s UNMATCHED!\n",
+                        master->stats.unmatched,
+                        master->stats.unmatched == 1 ? "" : "s");
+                master->stats.unmatched = 0;
+            }
         }
     }
 }
@@ -1298,9 +1534,13 @@ void ec_master_clear_device_stats(
 
     for (i = 0; i < EC_RATE_COUNT; i++) {
         master->device_stats.tx_frame_rates[i] = 0;
+        master->device_stats.rx_frame_rates[i] = 0;
         master->device_stats.tx_byte_rates[i] = 0;
+        master->device_stats.rx_byte_rates[i] = 0;
         master->device_stats.loss_rates[i] = 0;
     }
+
+    master->device_stats.jiffies = 0;
 }
 
 /*****************************************************************************/
@@ -1442,10 +1682,17 @@ void ec_master_exec_slave_fsms(
     ec_fsm_slave_t *fsm, *next;
     unsigned int count = 0;
 
+    // return if the slaves are not configured
+    if (master->rt_slave_requests && 
+            !master->rt_slaves_available) {
+        return;
+    }
+    
     list_for_each_entry_safe(fsm, next, &master->fsm_exec_list, list) {
         if (!fsm->datagram) {
-            EC_MASTER_WARN(master, "Slave %u FSM has zero datagram."
-                    "This is a bug!\n", fsm->slave->ring_position);
+            EC_MASTER_WARN(master, "Slave %s-%u FSM has zero datagram."
+                    "This is a bug!\n", ec_device_names[fsm->slave->device_index!=0],
+                    fsm->slave->ring_position);
             list_del_init(&fsm->list);
             master->fsm_exec_count--;
             return;
@@ -1468,7 +1715,8 @@ void ec_master_exec_slave_fsms(
         }
 
 #if DEBUG_INJECT
-        EC_MASTER_DBG(master, 1, "Executing slave %u FSM.\n",
+        EC_MASTER_DBG(master, 1, "Executing slave %s-%u FSM.\n",
+                ec_device_names[fsm->slave->device_index!=0],
                 fsm->slave->ring_position);
 #endif
         if (ec_fsm_slave_exec(fsm, datagram)) {
@@ -1504,8 +1752,9 @@ void ec_master_exec_slave_fsms(
                         &master->fsm_exec_list);
                 master->fsm_exec_count++;
 #if DEBUG_INJECT
-                EC_MASTER_DBG(master, 1, "New slave %u FSM"
+                EC_MASTER_DBG(master, 1, "New slave %s-%u FSM"
                         " consumed datagram %s, now %u FSMs in list.\n",
+                        ec_device_names[master->fsm_slave->device_index!=0],
                         master->fsm_slave->ring_position, datagram->name,
                         master->fsm_exec_count);
 #endif
@@ -1541,28 +1790,29 @@ static int ec_master_idle_thread(void *priv_data)
         ec_datagram_output_stats(&master->fsm_datagram);
 
         // receive
-        down(&master->io_sem);
+        ec_lock_down(&master->io_sem);
         ecrt_master_receive(master);
-        up(&master->io_sem);
+        ec_lock_up(&master->io_sem);
 
         // execute master & slave state machines
-        if (down_interruptible(&master->master_sem)) {
+        if (ec_lock_down_interruptible(&master->master_sem)) {
             break;
         }
 
         fsm_exec = ec_fsm_master_exec(&master->fsm);
 
+        // idle thread will still be in charge of calling the slave requests
         ec_master_exec_slave_fsms(master);
 
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
 
         // queue and send
-        down(&master->io_sem);
+        ec_lock_down(&master->io_sem);
         if (fsm_exec) {
             ec_master_queue_datagram(master, &master->fsm_datagram);
         }
         sent_bytes = ecrt_master_send(master);
-        up(&master->io_sem);
+        ec_lock_up(&master->io_sem);
 
         if (ec_fsm_master_idle(&master->fsm)) {
 #ifdef EC_USE_HRTIMER
@@ -1606,7 +1856,7 @@ static int ec_master_operation_thread(void *priv_data)
             ec_master_output_stats(master);
 
             // execute master & slave state machines
-            if (down_interruptible(&master->master_sem)) {
+            if (ec_lock_down_interruptible(&master->master_sem)) {
                 break;
             }
 
@@ -1616,9 +1866,13 @@ static int ec_master_operation_thread(void *priv_data)
                 master->injection_seq_fsm++;
             }
 
-            ec_master_exec_slave_fsms(master);
+            // if rt_slave_requests is true this will be handled by the
+            // app explicitly by calling ecrt_master_exec_slave_request()
+            if (!master->rt_slave_requests) {
+                ec_master_exec_slave_fsms(master);
+            }
 
-            up(&master->master_sem);
+            ec_lock_up(&master->master_sem);
         }
 
 #ifdef EC_USE_HRTIMER
@@ -1725,12 +1979,16 @@ static int ec_master_eoe_thread(void *priv_data)
         // actual EoE processing
         sth_to_send = 0;
         list_for_each_entry(eoe, &master->eoe_handlers, list) {
-            ec_eoe_run(eoe);
-            if (eoe->queue_datagram) {
-                sth_to_send = 1;
-            }
-            if (!ec_eoe_is_idle(eoe)) {
-                all_idle = 0;
+            if ((eoe->slave->current_state == EC_SLAVE_STATE_PREOP) ||
+                (eoe->slave->current_state == EC_SLAVE_STATE_SAFEOP) ||
+                (eoe->slave->current_state == EC_SLAVE_STATE_OP)) {
+                ec_eoe_run(eoe);
+                if (eoe->queue_datagram) {
+                    sth_to_send = 1;
+                }
+                if (!ec_eoe_is_idle(eoe)) {
+                    all_idle = 0;
+                }
             }
         }
 
@@ -1739,9 +1997,9 @@ static int ec_master_eoe_thread(void *priv_data)
                 ec_eoe_queue(eoe);
             }
             // (try to) send datagrams
-            down(&master->ext_queue_sem);
+            ec_lock_down(&master->ext_queue_sem);
             master->send_cb(master->cb_data);
-            up(&master->ext_queue_sem);
+            ec_lock_up(&master->ext_queue_sem);
         }
 
 schedule:
@@ -2055,25 +2313,31 @@ void ec_master_find_dc_ref_clock(
     ec_slave_t *slave, *ref = NULL;
 
     if (master->dc_ref_config) {
-        // Use application-selected reference clock
+        // Check application-selected reference clock
         slave = master->dc_ref_config->slave;
 
         if (slave) {
             if (slave->base_dc_supported && slave->has_dc_system_time) {
                 ref = slave;
+                EC_MASTER_INFO(master, "Using slave %s-%u as application selected"
+                        " DC reference clock.\n", ec_device_names[slave->device_index!=0],
+                        ref->ring_position);
             }
             else {
-                EC_MASTER_WARN(master, "Slave %u can not act as a"
-                        " DC reference clock!", slave->ring_position);
+                EC_MASTER_WARN(master, "Application selected slave %s-%u can not"
+                        " act as a DC reference clock!", ec_device_names[slave->device_index!=0],
+                        slave->ring_position);
             }
         }
         else {
-            EC_MASTER_WARN(master, "DC reference clock config (%u-%u)"
-                    " has no slave attached!\n", master->dc_ref_config->alias,
+            EC_MASTER_WARN(master, "Application selected DC reference clock"
+                    " config (%u-%u) has no slave attached!\n",
+                    master->dc_ref_config->alias,
                     master->dc_ref_config->position);
         }
     }
-    else {
+
+    if (!ref) {
         // Use first slave with DC support as reference clock
         for (slave = master->slaves;
                 slave < master->slaves + master->slave_count;
@@ -2089,8 +2353,8 @@ void ec_master_find_dc_ref_clock(
     master->dc_ref_clock = ref;
 
     if (ref) {
-        EC_MASTER_INFO(master, "Using slave %u as DC reference clock.\n",
-                ref->ring_position);
+        EC_MASTER_INFO(master, "Using slave %s-%u as DC reference clock.\n",
+                ec_device_names[ref->device_index!=0], ref->ring_position);
     }
     else {
         EC_MASTER_INFO(master, "No DC reference clock found.\n");
@@ -2102,6 +2366,8 @@ void ec_master_find_dc_ref_clock(
             ref ? ref->station_address : 0xffff, 0x0910, 4);
     ec_datagram_frmw(&master->sync_datagram,
             ref ? ref->station_address : 0xffff, 0x0910, 4);
+    ec_datagram_fprd(&master->sync64_datagram,
+            ref ? ref->station_address : 0xffff, 0x0910, 8);
 }
 
 /*****************************************************************************/
@@ -2112,7 +2378,7 @@ void ec_master_find_dc_ref_clock(
  */
 int ec_master_calc_topology_rec(
         ec_master_t *master, /**< EtherCAT master. */
-        ec_slave_t *port0_slave, /**< Slave at port 0. */
+        ec_slave_t *upstream_slave, /**< Slave at upstream port. */
         unsigned int *slave_position /**< Slave position. */
         )
 {
@@ -2124,10 +2390,10 @@ int ec_master_calc_topology_rec(
         3, 2, 0, 1
     };
 
-    slave->ports[0].next_slave = port0_slave;
+    slave->ports[slave->upstream_port].next_slave = upstream_slave;
 
-    port_index = 3;
-    while (port_index != 0) {
+    port_index = next_table[slave->upstream_port];
+    while (port_index != slave->upstream_port) {
         if (!slave->ports[port_index].link.loop_closed) {
             *slave_position = *slave_position + 1;
             if (*slave_position < master->slave_count) {
@@ -2158,9 +2424,16 @@ void ec_master_calc_topology(
         )
 {
     unsigned int slave_position = 0;
+    ec_slave_t *slave;
 
     if (master->slave_count == 0)
         return;
+
+    for (slave = master->slaves;
+            slave < master->slaves + master->slave_count;
+            slave++) {
+        ec_slave_calc_upstream_port(slave);
+    }
 
     if (ec_master_calc_topology_rec(master, NULL, &slave_position))
         EC_MASTER_ERR(master, "Failed to calculate bus topology.\n");
@@ -2237,6 +2510,60 @@ void ec_master_request_op(
 #endif
 }
 
+/*****************************************************************************/
+
+int ec_master_dict_upload(ec_master_t *master, uint16_t slave_position)
+{
+    ec_dict_request_t request;
+    ec_slave_t *slave;
+    int ret = 0;
+
+    EC_MASTER_DBG(master, 1, "%s(master = 0x%p, slave_position = %u\n",
+            __func__, master, slave_position);
+
+    ec_dict_request_init(&request);
+    ec_dict_request_read(&request);
+
+    if (ec_lock_down_interruptible(&master->master_sem)) {
+        return -EINTR;
+    }
+
+    if (!(slave = ec_master_find_slave(master, 0, slave_position))) {
+        ec_lock_up(&master->master_sem);
+        EC_MASTER_ERR(master, "Slave %u does not exist!\n", slave_position);
+        return -EINVAL;
+    }
+
+    EC_SLAVE_DBG(slave, 1, "Scheduling dictionary upload request.\n");
+
+    // schedule request.
+    list_add_tail(&request.list, &slave->dict_requests);
+
+    ec_lock_up(&master->master_sem);
+
+    // wait for processing through FSM
+    if (wait_event_interruptible(master->request_queue,
+                request.state != EC_INT_REQUEST_QUEUED)) {
+        // interrupted by signal
+        ec_lock_down(&master->master_sem);
+        if (request.state == EC_INT_REQUEST_QUEUED) {
+            list_del(&request.list);
+            ec_lock_up(&master->master_sem);
+            return -EINTR;
+        }
+        // request already processing: interrupt not possible.
+        ec_lock_up(&master->master_sem);
+    }
+
+    // wait until master FSM has finished processing
+    wait_event(master->request_queue, request.state != EC_INT_REQUEST_BUSY);
+
+    if (request.state != EC_INT_REQUEST_SUCCESS) {
+        ret = -EIO;
+    }
+    return ret;
+}
+
 /******************************************************************************
  *  Application interface
  *****************************************************************************/
@@ -2261,7 +2588,7 @@ ec_domain_t *ecrt_master_create_domain_err(
         return ERR_PTR(-ENOMEM);
     }
 
-    down(&master->master_sem);
+    ec_lock_down(&master->master_sem);
 
     if (list_empty(&master->domains)) {
         index = 0;
@@ -2273,7 +2600,7 @@ ec_domain_t *ecrt_master_create_domain_err(
     ec_domain_init(domain, master, index);
     list_add_tail(&domain->list, &master->domains);
 
-    up(&master->master_sem);
+    ec_lock_up(&master->master_sem);
 
     EC_MASTER_DBG(master, 1, "Created domain %u.\n", domain->index);
 
@@ -2288,6 +2615,14 @@ ec_domain_t *ecrt_master_create_domain(
 {
     ec_domain_t *d = ecrt_master_create_domain_err(master);
     return IS_ERR(d) ? NULL : d;
+}
+
+/*****************************************************************************/
+
+int ecrt_master_setup_domain_memory(ec_master_t *master)
+{
+	// not currently supported
+    return -ENOMEM;  // FIXME
 }
 
 /*****************************************************************************/
@@ -2308,21 +2643,21 @@ int ecrt_master_activate(ec_master_t *master)
         return 0;
     }
 
-    down(&master->master_sem);
+    ec_lock_down(&master->master_sem);
 
     // finish all domains
     domain_offset = 0;
     list_for_each_entry(domain, &master->domains, list) {
         ret = ec_domain_finish(domain, domain_offset);
         if (ret < 0) {
-            up(&master->master_sem);
+            ec_lock_up(&master->master_sem);
             EC_MASTER_ERR(master, "Failed to finish domain 0x%p!\n", domain);
             return ret;
         }
         domain_offset += domain->data_size;
     }
 
-    up(&master->master_sem);
+    ec_lock_up(&master->master_sem);
 
     // restart EoE process and master thread with new locking
 
@@ -2360,8 +2695,57 @@ int ecrt_master_activate(ec_master_t *master)
 
     // notify state machine, that the configuration shall now be applied
     master->config_changed = 1;
+    master->dc_offset_valid = 0;
 
     return 0;
+}
+
+/*****************************************************************************/
+
+void ecrt_master_deactivate_slaves(ec_master_t *master)
+{
+    ec_slave_t *slave;
+    ec_slave_config_t *sc, *next;
+#ifdef EC_EOE
+    ec_eoe_t *eoe;
+#endif
+
+    EC_MASTER_DBG(master, 1, "%s(master = 0x%p)\n", __func__, master);
+
+    if (!master->active) {
+        EC_MASTER_WARN(master, "%s: Master not active.\n", __func__);
+        return;
+    }
+
+
+    // clear dc settings on all slaves
+    list_for_each_entry_safe(sc, next, &master->configs, list) {
+        if (sc->dc_assign_activate) {
+            ecrt_slave_config_dc(sc, 0x0000, 0, 0, 0, 0);
+        }
+    }
+
+
+    for (slave = master->slaves;
+            slave < master->slaves + master->slave_count;
+            slave++) {
+
+        // set states for all slaves
+        ec_slave_request_state(slave, EC_SLAVE_STATE_PREOP);
+
+        // mark for reconfiguration, because the master could have no
+        // possibility for a reconfiguration between two sequential operation
+        // phases.
+        slave->force_config = 1;
+    }
+
+#ifdef EC_EOE
+    // ... but leave EoE slaves in OP
+    list_for_each_entry(eoe, &master->eoe_handlers, list) {
+        if (ec_eoe_is_open(eoe))
+            ec_slave_request_state(eoe->slave, EC_SLAVE_STATE_OP);
+    }
+#endif
 }
 
 /*****************************************************************************/
@@ -2378,6 +2762,7 @@ void ecrt_master_deactivate(ec_master_t *master)
 
     if (!master->active) {
         EC_MASTER_WARN(master, "%s: Master not active.\n", __func__);
+        ec_master_clear_config(master);
         return;
     }
 
@@ -2400,6 +2785,9 @@ void ecrt_master_deactivate(ec_master_t *master)
         // set states for all slaves
         ec_slave_request_state(slave, EC_SLAVE_STATE_PREOP);
 
+        // clear read_mbox_busy flag in case slave CoE FSM were interrupted
+        ec_read_mbox_lock_clear(slave);
+
         // mark for reconfiguration, because the master could have no
         // possibility for a reconfiguration between two sequential operation
         // phases.
@@ -2417,6 +2805,13 @@ void ecrt_master_deactivate(ec_master_t *master)
     master->app_time = 0ULL;
     master->app_start_time = 0ULL;
     master->has_app_time = 0;
+    master->dc_offset_valid = 0;
+
+    /* Disallow scanning to get into the same state like after a master
+     * request (after ec_master_enter_operation_phase() is called). */
+    master->allow_scan = 0;
+
+    master->active = 0;
 
 #ifdef EC_EOE
     if (eoe_was_running) {
@@ -2427,12 +2822,6 @@ void ecrt_master_deactivate(ec_master_t *master)
                 "EtherCAT-IDLE")) {
         EC_MASTER_WARN(master, "Failed to restart master thread!\n");
     }
-
-    /* Disallow scanning to get into the same state like after a master
-     * request (after ec_master_enter_operation_phase() is called). */
-    master->allow_scan = 0;
-
-    master->active = 0;
 }
 
 /*****************************************************************************/
@@ -2598,14 +2987,14 @@ ec_slave_config_t *ecrt_master_slave_config_err(ec_master_t *master,
         ec_slave_config_init(sc, master,
                 alias, position, vendor_id, product_code);
 
-        down(&master->master_sem);
+        ec_lock_down(&master->master_sem);
 
         // try to find the addressed slave
         ec_slave_config_attach(sc);
         ec_slave_config_load_default_sync_config(sc);
         list_add_tail(&sc->list, &master->configs);
 
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
     }
 
     return sc;
@@ -2627,18 +3016,22 @@ ec_slave_config_t *ecrt_master_slave_config(ec_master_t *master,
 int ecrt_master_select_reference_clock(ec_master_t *master,
         ec_slave_config_t *sc)
 {
-    if (sc) {
-        ec_slave_t *slave = sc->slave;
+    master->dc_ref_config = sc;
 
-        // output an early warning
-        if (slave &&
-                (!slave->base_dc_supported || !slave->has_dc_system_time)) {
-            EC_MASTER_WARN(master, "Slave %u can not act as"
-                    " a reference clock!", slave->ring_position);
-        }
+    if (master->dc_ref_config) {
+        EC_MASTER_INFO(master, "Application selected DC reference clock"
+                " config (%u-%u) set by application.\n",
+                master->dc_ref_config->alias,
+                master->dc_ref_config->position);
+    }
+    else {
+        EC_MASTER_INFO(master, "Application selected DC reference clock"
+                " config cleared by application.\n");
     }
 
-    master->dc_ref_config = sc;
+    // update dc datagrams
+    ec_master_find_dc_ref_clock(master);
+
     return 0;
 }
 
@@ -2665,7 +3058,7 @@ int ecrt_master_get_slave(ec_master_t *master, uint16_t slave_position,
     unsigned int i;
     int ret = 0;
 
-    if (down_interruptible(&master->master_sem)) {
+    if (ec_lock_down_interruptible(&master->master_sem)) {
         return -EINTR;
     }
 
@@ -2676,13 +3069,20 @@ int ecrt_master_get_slave(ec_master_t *master, uint16_t slave_position,
        goto out_get_slave;
     }
 
+    if (slave->sii_image == NULL) {
+        EC_MASTER_WARN(master, "Cannot access SII data from slave position %s-%u",
+                ec_device_names[slave->device_index!=0], slave->ring_position);
+        ret = -ENOENT;
+        goto out_get_slave;
+    }
+
     slave_info->position = slave->ring_position;
-    slave_info->vendor_id = slave->sii.vendor_id;
-    slave_info->product_code = slave->sii.product_code;
-    slave_info->revision_number = slave->sii.revision_number;
-    slave_info->serial_number = slave->sii.serial_number;
+    slave_info->vendor_id = slave->sii_image->sii.vendor_id;
+    slave_info->product_code = slave->sii_image->sii.product_code;
+    slave_info->revision_number = slave->sii_image->sii.revision_number;
+    slave_info->serial_number = slave->sii_image->sii.serial_number;
     slave_info->alias = slave->effective_alias;
-    slave_info->current_on_ebus = slave->sii.current_on_ebus;
+    slave_info->current_on_ebus = slave->sii_image->sii.current_on_ebus;
 
     for (i = 0; i < EC_MAX_PORTS; i++) {
         slave_info->ports[i].desc = slave->ports[i].desc;
@@ -2701,19 +3101,22 @@ int ecrt_master_get_slave(ec_master_t *master, uint16_t slave_position,
         slave_info->ports[i].delay_to_next_dc =
             slave->ports[i].delay_to_next_dc;
     }
+    slave_info->upstream_port = slave->upstream_port;
 
     slave_info->al_state = slave->current_state;
     slave_info->error_flag = slave->error_flag;
-    slave_info->sync_count = slave->sii.sync_count;
+    slave_info->scan_required = slave->scan_required;
+    slave_info->ready = ec_fsm_slave_is_ready(&slave->fsm);
+    slave_info->sync_count = slave->sii_image->sii.sync_count;
     slave_info->sdo_count = ec_slave_sdo_count(slave);
-    if (slave->sii.name) {
-        strncpy(slave_info->name, slave->sii.name, EC_MAX_STRING_LENGTH);
+    if (slave->sii_image->sii.name) {
+        strncpy(slave_info->name, slave->sii_image->sii.name, EC_MAX_STRING_LENGTH);
     } else {
         slave_info->name[0] = 0;
     }
 
 out_get_slave:
-    up(&master->master_sem);
+    ec_lock_up(&master->master_sem);
 
     return ret;
 }
@@ -2741,6 +3144,7 @@ void ecrt_master_state(const ec_master_t *master, ec_master_state_t *state)
     state->slaves_responding = 0U;
     state->al_states = 0;
     state->link_up = 0U;
+    state->scan_busy = master->scan_busy ? 1U : 0U;
 
     for (dev_idx = EC_DEVICE_MAIN; dev_idx < ec_master_num_devices(master);
             dev_idx++) {
@@ -2795,6 +3199,10 @@ int ecrt_master_reference_clock_time(ec_master_t *master, uint32_t *time)
         return -EIO;
     }
 
+    if (!master->dc_offset_valid) {
+        return -EAGAIN;
+    }
+
     // Get returned datagram time, transmission delay removed.
     *time = EC_READ_U32(master->sync_datagram.data) -
         master->dc_ref_clock->transmission_delay;
@@ -2806,7 +3214,7 @@ int ecrt_master_reference_clock_time(ec_master_t *master, uint32_t *time)
 
 void ecrt_master_sync_reference_clock(ec_master_t *master)
 {
-    if (master->dc_ref_clock) {
+    if (master->dc_ref_clock && master->dc_offset_valid) {
         EC_WRITE_U32(master->ref_sync_datagram.data, master->app_time);
         ec_master_queue_datagram(master, &master->ref_sync_datagram);
     }
@@ -2816,10 +3224,43 @@ void ecrt_master_sync_reference_clock(ec_master_t *master)
 
 void ecrt_master_sync_slave_clocks(ec_master_t *master)
 {
-    if (master->dc_ref_clock) {
+    if (master->dc_ref_clock && master->dc_offset_valid) {
         ec_datagram_zero(&master->sync_datagram);
         ec_master_queue_datagram(master, &master->sync_datagram);
     }
+}
+
+/*****************************************************************************/
+
+void ecrt_master_64bit_reference_clock_time_queue(ec_master_t *master)
+{
+    if (master->dc_ref_clock && master->dc_offset_valid) {
+        ec_datagram_zero(&master->sync64_datagram);
+        ec_master_queue_datagram(master, &master->sync64_datagram);
+    }
+}
+
+/*****************************************************************************/
+
+int ecrt_master_64bit_reference_clock_time(ec_master_t *master, uint64_t *time)
+{
+    if (!master->dc_ref_clock) {
+        return -ENXIO;
+    }
+
+    if (master->sync64_datagram.state != EC_DATAGRAM_RECEIVED) {
+        return -EIO;
+    }
+
+    if (!master->dc_offset_valid) {
+    	return -EAGAIN;
+    }
+
+    // Get returned datagram time, transmission delay removed.
+    *time = EC_READ_U64(master->sync64_datagram.data) -
+        master->dc_ref_clock->transmission_delay;
+
+    return 0;
 }
 
 /*****************************************************************************/
@@ -2874,13 +3315,13 @@ int ecrt_master_sdo_download(ec_master_t *master, uint16_t slave_position,
     request.data_size = data_size;
     ecrt_sdo_request_write(&request);
 
-    if (down_interruptible(&master->master_sem)) {
+    if (ec_lock_down_interruptible(&master->master_sem)) {
         ec_sdo_request_clear(&request);
         return -EINTR;
     }
 
     if (!(slave = ec_master_find_slave(master, 0, slave_position))) {
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
         EC_MASTER_ERR(master, "Slave %u does not exist!\n", slave_position);
         ec_sdo_request_clear(&request);
         return -EINVAL;
@@ -2891,21 +3332,21 @@ int ecrt_master_sdo_download(ec_master_t *master, uint16_t slave_position,
     // schedule request.
     list_add_tail(&request.list, &slave->sdo_requests);
 
-    up(&master->master_sem);
+    ec_lock_up(&master->master_sem);
 
     // wait for processing through FSM
     if (wait_event_interruptible(master->request_queue,
                 request.state != EC_INT_REQUEST_QUEUED)) {
         // interrupted by signal
-        down(&master->master_sem);
+        ec_lock_down(&master->master_sem);
         if (request.state == EC_INT_REQUEST_QUEUED) {
             list_del(&request.list);
-            up(&master->master_sem);
+            ec_lock_up(&master->master_sem);
             ec_sdo_request_clear(&request);
             return -EINTR;
         }
         // request already processing: interrupt not possible.
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
     }
 
     // wait until master FSM has finished processing
@@ -2947,25 +3388,24 @@ int ecrt_master_sdo_download_complete(ec_master_t *master,
     }
 
     ec_sdo_request_init(&request);
-    ecrt_sdo_request_index(&request, index, 0);
+    ecrt_sdo_request_index_complete(&request, index);
     ret = ec_sdo_request_alloc(&request, data_size);
     if (ret) {
         ec_sdo_request_clear(&request);
         return ret;
     }
 
-    request.complete_access = 1;
     memcpy(request.data, data, data_size);
     request.data_size = data_size;
     ecrt_sdo_request_write(&request);
 
-    if (down_interruptible(&master->master_sem)) {
+    if (ec_lock_down_interruptible(&master->master_sem)) {
         ec_sdo_request_clear(&request);
         return -EINTR;
     }
 
     if (!(slave = ec_master_find_slave(master, 0, slave_position))) {
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
         EC_MASTER_ERR(master, "Slave %u does not exist!\n", slave_position);
         ec_sdo_request_clear(&request);
         return -EINVAL;
@@ -2977,21 +3417,21 @@ int ecrt_master_sdo_download_complete(ec_master_t *master,
     // schedule request.
     list_add_tail(&request.list, &slave->sdo_requests);
 
-    up(&master->master_sem);
+    ec_lock_up(&master->master_sem);
 
     // wait for processing through FSM
     if (wait_event_interruptible(master->request_queue,
                 request.state != EC_INT_REQUEST_QUEUED)) {
         // interrupted by signal
-        down(&master->master_sem);
+        ec_lock_down(&master->master_sem);
         if (request.state == EC_INT_REQUEST_QUEUED) {
             list_del(&request.list);
-            up(&master->master_sem);
+            ec_lock_up(&master->master_sem);
             ec_sdo_request_clear(&request);
             return -EINTR;
         }
         // request already processing: interrupt not possible.
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
     }
 
     // wait until master FSM has finished processing
@@ -3032,13 +3472,13 @@ int ecrt_master_sdo_upload(ec_master_t *master, uint16_t slave_position,
     ecrt_sdo_request_index(&request, index, subindex);
     ecrt_sdo_request_read(&request);
 
-    if (down_interruptible(&master->master_sem)) {
+    if (ec_lock_down_interruptible(&master->master_sem)) {
         ec_sdo_request_clear(&request);
         return -EINTR;
     }
 
     if (!(slave = ec_master_find_slave(master, 0, slave_position))) {
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
         ec_sdo_request_clear(&request);
         EC_MASTER_ERR(master, "Slave %u does not exist!\n", slave_position);
         return -EINVAL;
@@ -3049,21 +3489,104 @@ int ecrt_master_sdo_upload(ec_master_t *master, uint16_t slave_position,
     // schedule request.
     list_add_tail(&request.list, &slave->sdo_requests);
 
-    up(&master->master_sem);
+    ec_lock_up(&master->master_sem);
 
     // wait for processing through FSM
     if (wait_event_interruptible(master->request_queue,
                 request.state != EC_INT_REQUEST_QUEUED)) {
         // interrupted by signal
-        down(&master->master_sem);
+        ec_lock_down(&master->master_sem);
         if (request.state == EC_INT_REQUEST_QUEUED) {
             list_del(&request.list);
-            up(&master->master_sem);
+            ec_lock_up(&master->master_sem);
             ec_sdo_request_clear(&request);
             return -EINTR;
         }
         // request already processing: interrupt not possible.
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
+    }
+
+    // wait until master FSM has finished processing
+    wait_event(master->request_queue, request.state != EC_INT_REQUEST_BUSY);
+
+    *abort_code = request.abort_code;
+
+    if (request.state != EC_INT_REQUEST_SUCCESS) {
+        *result_size = 0;
+        if (request.errno) {
+            ret = -request.errno;
+        } else {
+            ret = -EIO;
+        }
+    } else {
+        if (request.data_size > target_size) {
+            EC_MASTER_ERR(master, "Buffer too small.\n");
+            ret = -EOVERFLOW;
+        }
+        else {
+            memcpy(target, request.data, request.data_size);
+            *result_size = request.data_size;
+            ret = 0;
+        }
+    }
+
+    ec_sdo_request_clear(&request);
+    return ret;
+}
+
+/*****************************************************************************/
+
+int ecrt_master_sdo_upload_complete(ec_master_t *master, uint16_t slave_position,
+        uint16_t index, uint8_t *target,
+        size_t target_size, size_t *result_size, uint32_t *abort_code)
+{
+    ec_sdo_request_t request;
+    ec_slave_t *slave;
+    int ret = 0;
+
+    EC_MASTER_DBG(master, 1, "%s(master = 0x%p,"
+            " slave_position = %u, index = 0x%04X,"
+            " target = 0x%p, target_size = %zu, result_size = 0x%p,"
+            " abort_code = 0x%p)\n",
+            __func__, master, slave_position, index,
+            target, target_size, result_size, abort_code);
+
+    ec_sdo_request_init(&request);
+    ecrt_sdo_request_index_complete(&request, index);
+    ecrt_sdo_request_read(&request);
+
+    if (ec_lock_down_interruptible(&master->master_sem)) {
+        ec_sdo_request_clear(&request);
+        return -EINTR;
+    }
+
+    if (!(slave = ec_master_find_slave(master, 0, slave_position))) {
+        ec_lock_up(&master->master_sem);
+        ec_sdo_request_clear(&request);
+        EC_MASTER_ERR(master, "Slave %u does not exist!\n", slave_position);
+        return -EINVAL;
+    }
+
+    EC_SLAVE_DBG(slave, 1, "Scheduling SDO upload request (complete access).\n");
+
+    // schedule request.
+    list_add_tail(&request.list, &slave->sdo_requests);
+
+    ec_lock_up(&master->master_sem);
+
+    // wait for processing through FSM
+    if (wait_event_interruptible(master->request_queue,
+                request.state != EC_INT_REQUEST_QUEUED)) {
+        // interrupted by signal
+        ec_lock_down(&master->master_sem);
+        if (request.state == EC_INT_REQUEST_QUEUED) {
+            list_del(&request.list);
+            ec_lock_up(&master->master_sem);
+            ec_sdo_request_clear(&request);
+            return -EINTR;
+        }
+        // request already processing: interrupt not possible.
+        ec_lock_up(&master->master_sem);
     }
 
     // wait until master FSM has finished processing
@@ -3123,13 +3646,13 @@ int ecrt_master_write_idn(ec_master_t *master, uint16_t slave_position,
     request.data_size = data_size;
     ec_soe_request_write(&request);
 
-    if (down_interruptible(&master->master_sem)) {
+    if (ec_lock_down_interruptible(&master->master_sem)) {
         ec_soe_request_clear(&request);
         return -EINTR;
     }
 
     if (!(slave = ec_master_find_slave(master, 0, slave_position))) {
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
         EC_MASTER_ERR(master, "Slave %u does not exist!\n",
                 slave_position);
         ec_soe_request_clear(&request);
@@ -3141,21 +3664,21 @@ int ecrt_master_write_idn(ec_master_t *master, uint16_t slave_position,
     // schedule SoE write request.
     list_add_tail(&request.list, &slave->soe_requests);
 
-    up(&master->master_sem);
+    ec_lock_up(&master->master_sem);
 
     // wait for processing through FSM
     if (wait_event_interruptible(master->request_queue,
                 request.state != EC_INT_REQUEST_QUEUED)) {
         // interrupted by signal
-        down(&master->master_sem);
+        ec_lock_down(&master->master_sem);
         if (request.state == EC_INT_REQUEST_QUEUED) {
             // abort request
             list_del(&request.list);
-            up(&master->master_sem);
+            ec_lock_up(&master->master_sem);
             ec_soe_request_clear(&request);
             return -EINTR;
         }
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
     }
 
     // wait until master FSM has finished processing
@@ -3190,13 +3713,13 @@ int ecrt_master_read_idn(ec_master_t *master, uint16_t slave_position,
     ec_soe_request_set_idn(&request, idn);
     ec_soe_request_read(&request);
 
-    if (down_interruptible(&master->master_sem)) {
+    if (ec_lock_down_interruptible(&master->master_sem)) {
         ec_soe_request_clear(&request);
         return -EINTR;
     }
 
     if (!(slave = ec_master_find_slave(master, 0, slave_position))) {
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
         ec_soe_request_clear(&request);
         EC_MASTER_ERR(master, "Slave %u does not exist!\n", slave_position);
         return -EINVAL;
@@ -3207,21 +3730,21 @@ int ecrt_master_read_idn(ec_master_t *master, uint16_t slave_position,
     // schedule request.
     list_add_tail(&request.list, &slave->soe_requests);
 
-    up(&master->master_sem);
+    ec_lock_up(&master->master_sem);
 
     // wait for processing through FSM
     if (wait_event_interruptible(master->request_queue,
                 request.state != EC_INT_REQUEST_QUEUED)) {
         // interrupted by signal
-        down(&master->master_sem);
+        ec_lock_down(&master->master_sem);
         if (request.state == EC_INT_REQUEST_QUEUED) {
             list_del(&request.list);
-            up(&master->master_sem);
+            ec_lock_up(&master->master_sem);
             ec_soe_request_clear(&request);
             return -EINTR;
         }
         // request already processing: interrupt not possible.
-        up(&master->master_sem);
+        ec_lock_up(&master->master_sem);
     }
 
     // wait until master FSM has finished processing
@@ -3256,6 +3779,38 @@ int ecrt_master_read_idn(ec_master_t *master, uint16_t slave_position,
 
 /*****************************************************************************/
 
+int ecrt_master_rt_slave_requests(ec_master_t *master, 
+        unsigned int rt_slave_requests)
+{
+    // set flag as to whether the master or the external application
+    // should be handling processing the slave request
+    master->rt_slave_requests = rt_slave_requests;
+    
+    if (master->rt_slave_requests) {
+        EC_MASTER_INFO(master, "Application selected to process"
+                " slave request by the application.\n");
+    }
+    else {
+        EC_MASTER_INFO(master, "Application selected to process"
+                " slave request by the master.\n");
+    }
+    
+    return 0;
+}
+
+/*****************************************************************************/
+
+void ecrt_master_exec_slave_requests(ec_master_t *master)
+{
+    // ignore this call if the master is not operational or not set to
+    // handle the slave requests from the application
+    if (master->rt_slave_requests && (master->phase == EC_OPERATION)) {
+        ec_master_exec_slave_fsms(master);
+    }
+}
+
+/*****************************************************************************/
+
 void ecrt_master_reset(ec_master_t *master)
 {
     ec_slave_config_t *sc;
@@ -3272,7 +3827,9 @@ void ecrt_master_reset(ec_master_t *master)
 /** \cond */
 
 EXPORT_SYMBOL(ecrt_master_create_domain);
+EXPORT_SYMBOL(ecrt_master_setup_domain_memory);
 EXPORT_SYMBOL(ecrt_master_activate);
+EXPORT_SYMBOL(ecrt_master_deactivate_slaves);
 EXPORT_SYMBOL(ecrt_master_deactivate);
 EXPORT_SYMBOL(ecrt_master_send);
 EXPORT_SYMBOL(ecrt_master_send_ext);
@@ -3288,13 +3845,18 @@ EXPORT_SYMBOL(ecrt_master_application_time);
 EXPORT_SYMBOL(ecrt_master_sync_reference_clock);
 EXPORT_SYMBOL(ecrt_master_sync_slave_clocks);
 EXPORT_SYMBOL(ecrt_master_reference_clock_time);
+EXPORT_SYMBOL(ecrt_master_64bit_reference_clock_time_queue);
+EXPORT_SYMBOL(ecrt_master_64bit_reference_clock_time);
 EXPORT_SYMBOL(ecrt_master_sync_monitor_queue);
 EXPORT_SYMBOL(ecrt_master_sync_monitor_process);
 EXPORT_SYMBOL(ecrt_master_sdo_download);
 EXPORT_SYMBOL(ecrt_master_sdo_download_complete);
 EXPORT_SYMBOL(ecrt_master_sdo_upload);
+EXPORT_SYMBOL(ecrt_master_sdo_upload_complete);
 EXPORT_SYMBOL(ecrt_master_write_idn);
 EXPORT_SYMBOL(ecrt_master_read_idn);
+EXPORT_SYMBOL(ecrt_master_rt_slave_requests);
+EXPORT_SYMBOL(ecrt_master_exec_slave_requests);
 EXPORT_SYMBOL(ecrt_master_reset);
 
 /** \endcond */

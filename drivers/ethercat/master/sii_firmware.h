@@ -2,7 +2,7 @@
  *
  *  $Id$
  *
- *  Copyright (C) 2006-2008  Florian Pose, Ingenieurgemeinschaft IgH
+ *  Copyright (C) 2016  Gavin Lambert
  *
  *  This file is part of the IgH EtherCAT Master.
  *
@@ -29,44 +29,28 @@
 
 /**
    \file
-   Mailbox functionality.
+   SII "firmware" loader.
 */
 
 /*****************************************************************************/
 
-#ifndef __EC_MAILBOX_H__
-#define __EC_MAILBOX_H__
+#ifndef __EC_SII_FIRMWARE_H__
+#define __EC_SII_FIRMWARE_H__
 
-#include "slave.h"
+#ifdef EC_SII_OVERRIDE
 
-/*****************************************************************************/
+#include <linux/firmware.h>
 
-/** Size of the mailbox header.
- */
-#define EC_MBOX_HEADER_SIZE 6
-
-/** Mailbox types.
- *
- * These are used in the 'Type' field of the mailbox header.
- */
-enum {
-    EC_MBOX_TYPE_EOE = 0x02,
-    EC_MBOX_TYPE_COE = 0x03,
-    EC_MBOX_TYPE_FOE = 0x04,
-    EC_MBOX_TYPE_SOE = 0x05,
-    EC_MBOX_TYPE_VOE = 0x0f,
-};
+#include "globals.h"
 
 /*****************************************************************************/
 
-uint8_t *ec_slave_mbox_prepare_send(const ec_slave_t *, ec_datagram_t *,
-                                    uint8_t, size_t);
-int      ec_slave_mbox_prepare_check(const ec_slave_t *, ec_datagram_t *);
-int      ec_slave_mbox_check(const ec_datagram_t *);
-int      ec_slave_mbox_prepare_fetch(const ec_slave_t *, ec_datagram_t *);
-uint8_t *ec_slave_mbox_fetch(const ec_slave_t *, ec_mbox_data_t *,
-                             uint8_t *, size_t *);
+void ec_request_sii_firmware(ec_slave_t *, void *,
+            void (*)(const struct firmware *, void *));
+
+void ec_release_sii_firmware(const struct firmware *);
 
 /*****************************************************************************/
 
+#endif
 #endif

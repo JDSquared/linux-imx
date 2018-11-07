@@ -512,14 +512,14 @@ void ecrt_domain_external_memory(ec_domain_t *domain, uint8_t *mem)
     EC_MASTER_DBG(domain->master, 1, "ecrt_domain_external_memory("
             "domain = 0x%p, mem = 0x%p)\n", domain, mem);
 
-    down(&domain->master->master_sem);
+    ec_lock_down(&domain->master->master_sem);
 
     ec_domain_clear_data(domain);
 
     domain->data = mem;
     domain->data_origin = EC_ORIG_EXTERNAL;
 
-    up(&domain->master->master_sem);
+    ec_lock_up(&domain->master->master_sem);
 }
 
 /*****************************************************************************/
@@ -698,19 +698,19 @@ void ecrt_domain_process(ec_domain_t *domain)
         }
 #if EC_MAX_NUM_DEVICES > 1
         if (ec_master_num_devices(domain->master) > 1) {
-            printk(" (");
+            printk(KERN_CONT " (");
             for (dev_idx = EC_DEVICE_MAIN;
                     dev_idx < ec_master_num_devices(domain->master);
                     dev_idx++) {
-                printk("%u", domain->working_counter[dev_idx]);
+                printk(KERN_CONT "%u", domain->working_counter[dev_idx]);
                 if (dev_idx + 1 < ec_master_num_devices(domain->master)) {
-                    printk("+");
+                    printk(KERN_CONT "+");
                 }
             }
-            printk(")");
+            printk(KERN_CONT ")");
         }
 #endif
-        printk(".\n");
+        printk(KERN_CONT ".\n");
 
         domain->working_counter_changes = 0;
     }

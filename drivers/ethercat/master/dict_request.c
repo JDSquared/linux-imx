@@ -27,64 +27,36 @@
  *
  *****************************************************************************/
 
-/**
-   \file
-   EtherCAT slave information interface FSM structure.
-*/
-
-/*****************************************************************************/
-
-#ifndef __EC_FSM_SII_H__
-#define __EC_FSM_SII_H__
-
-#include "globals.h"
-#include "datagram.h"
-#include "slave.h"
-
-/*****************************************************************************/
-
-/** SII access addressing mode.
+/** \file
+ * Canopen over EtherCAT dictionary request functions.
  */
-typedef enum {
-    EC_FSM_SII_USE_INCREMENT_ADDRESS, /**< Use auto-increment addressing. */
-    EC_FSM_SII_USE_CONFIGURED_ADDRESS /**< Use configured addresses. */
-} ec_fsm_sii_addressing_t;
 
 /*****************************************************************************/
 
-typedef struct ec_fsm_sii ec_fsm_sii_t; /**< \see ec_fsm_sii */
+#include "dict_request.h"
 
-/**
-   Slave information interface FSM.
-*/
 
-struct ec_fsm_sii
+/*****************************************************************************/
+
+/** Dictionary request constructor.
+ */
+void ec_dict_request_init(ec_dict_request_t *req)
 {
-    ec_slave_t *slave; /**< slave the FSM runs on */
-    ec_datagram_t *datagram; /**< datagram used in the state machine */
-    unsigned int retries; /**< retries upon datagram timeout */
-
-    void (*state)(ec_fsm_sii_t *, ec_datagram_t *); /**< SII state function */
-    uint16_t word_offset; /**< input: word offset in SII */
-    ec_fsm_sii_addressing_t mode; /**< reading via APRD or NPRD */
-    uint8_t value[4]; /**< raw SII value (32bit) */
-    unsigned long jiffies_start; /**< Start timestamp. */
-    uint8_t check_once_more; /**< one more try after timeout */
-};
+    req->state = EC_INT_REQUEST_INIT;
+}
 
 /*****************************************************************************/
 
-void ec_fsm_sii_init(ec_fsm_sii_t *);
-void ec_fsm_sii_clear(ec_fsm_sii_t *);
-
-void ec_fsm_sii_read(ec_fsm_sii_t *, ec_slave_t *,
-                     uint16_t, ec_fsm_sii_addressing_t);
-void ec_fsm_sii_write(ec_fsm_sii_t *, ec_slave_t *, uint16_t,
-        const uint16_t *, ec_fsm_sii_addressing_t);
-
-int ec_fsm_sii_exec(ec_fsm_sii_t *, ec_datagram_t *);
-int ec_fsm_sii_success(ec_fsm_sii_t *);
+void ec_dict_request_read(ec_dict_request_t *req)
+{
+    req->state = EC_INT_REQUEST_QUEUED;
+}
 
 /*****************************************************************************/
 
-#endif
+/** \cond */
+
+
+/** \endcond */
+
+/*****************************************************************************/

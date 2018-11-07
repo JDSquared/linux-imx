@@ -58,9 +58,8 @@
 /** Number of state machine retries on datagram timeout. */
 #define EC_FSM_RETRIES 3
 
-/** Seconds to wait before fetching SDO dictionary
-    after slave entered PREOP state. */
-#define EC_WAIT_SDO_DICT 3
+/** If set, skip fetching SDO dictionary during slave scan. */
+#define EC_SKIP_SDO_DICT 1
 
 /** Minimum size of a buffer used with ec_state_string(). */
 #define EC_STATE_STRING_SIZE 32
@@ -102,6 +101,21 @@
 
 /** Word offset of first SII category. */
 #define EC_FIRST_SII_CATEGORY_OFFSET 0x40
+
+/** Word offset of SII alias. */
+#define EC_ALIAS_SII_OFFSET 0x04
+
+/** Word offset of SII vendor ID. */
+#define EC_VENDOR_SII_OFFSET 0x08
+
+/** Word offset of SII product number. */
+#define EC_PRODUCT_SII_OFFSET 0x0A
+
+/** Word offset of SII revision number. */
+#define EC_REVISION_SII_OFFSET 0x0C
+
+/** Word offset of SII serial number. */
+#define EC_SERIAL_SII_OFFSET 0x0E
 
 /** Size of a sync manager configuration page. */
 #define EC_SYNC_PAGE_SIZE 8
@@ -278,7 +292,7 @@ unsigned int ec_master_count(void);
 void ec_print_data(const uint8_t *, size_t);
 void ec_print_data_diff(const uint8_t *, const uint8_t *, size_t);
 size_t ec_state_string(uint8_t, char *, uint8_t);
-ssize_t ec_mac_print(const uint8_t *, char *);
+size_t ec_mac_print(const uint8_t *, char *);
 int ec_mac_is_zero(const uint8_t *);
 
 ec_master_t *ecrt_request_master_err(unsigned int);

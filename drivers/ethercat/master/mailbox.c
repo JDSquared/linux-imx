@@ -57,7 +57,13 @@ uint8_t *ec_slave_mbox_prepare_send(const ec_slave_t *slave, /**< slave */
     size_t total_size;
     int ret;
 
-    if (unlikely(!slave->sii.mailbox_protocols)) {
+    if (unlikely(!slave->sii_image)) {
+        EC_SLAVE_ERR(slave, "Slave cannot verify if mailbox communication"
+                " is supported!\n");
+        return ERR_PTR(-EAGAIN);
+    }
+
+    if (unlikely(!slave->sii_image->sii.mailbox_protocols)) {
         EC_SLAVE_ERR(slave, "Slave does not support mailbox"
                 " communication!\n");
         return ERR_PTR(-EPROTONOSUPPORT);
@@ -164,18 +170,23 @@ const ec_code_msg_t mbox_error_messages[] = {
  * \return Pointer to the received data, or ERR_PTR() code.
  */
 uint8_t *ec_slave_mbox_fetch(const ec_slave_t *slave, /**< slave */
-                             const ec_datagram_t *datagram, /**< datagram */
+                             ec_mbox_data_t *response_data, /**< response data */
                              uint8_t *type, /**< expected mailbox protocol */
                              size_t *size /**< size of the received data */
                              )
 {
     size_t data_size;
 
-    data_size = EC_READ_U16(datagram->data);
+    if (!response_data->data) {
+        EC_SLAVE_ERR(slave, "No mailbox response data received!\n");
+        return ERR_PTR(-EPROTO);
+    }
+
+    data_size = EC_READ_U16(response_data->data);
 
     if (data_size + EC_MBOX_HEADER_SIZE > slave->configured_tx_mailbox_size) {
         EC_SLAVE_ERR(slave, "Corrupt mailbox response received!\n");
-        ec_print_data(datagram->data, slave->configured_tx_mailbox_size);
+        ec_print_data(response_data->data, slave->configured_tx_mailbox_size);
         return ERR_PTR(-EPROTO);
     }
 
@@ -186,35 +197,35 @@ uint8_t *ec_slave_mbox_fetch(const ec_slave_t *slave, /**< slave */
     }
 #endif
 
-    *type = EC_READ_U8(datagram->data + 5) & 0x0F;
+    *type = EC_READ_U8(response_data->data + 5) & 0x0F;
     *size = data_size;
 
     if (*type == 0x00) {
         const ec_code_msg_t *mbox_msg;
-        uint16_t code = EC_READ_U16(datagram->data + 8);
+        uint16_t code = EC_READ_U16(response_data->data + 8);
 
         EC_SLAVE_ERR(slave, "Mailbox error response received - ");
 
         for (mbox_msg = mbox_error_messages; mbox_msg->code; mbox_msg++) {
             if (mbox_msg->code != code)
                 continue;
-            printk("Code 0x%04X: \"%s\".\n",
+            printk(KERN_CONT "Code 0x%04X: \"%s\".\n",
                     mbox_msg->code, mbox_msg->message);
             break;
         }
 
         if (!mbox_msg->code) {
-            printk("Unknown error reply code 0x%04X.\n", code);
+            printk(KERN_CONT "Unknown error reply code 0x%04X.\n", code);
         }
 
         if (slave->master->debug_level && data_size > 0) {
-            ec_print_data(datagram->data + EC_MBOX_HEADER_SIZE, data_size);
+            ec_print_data(response_data->data + EC_MBOX_HEADER_SIZE, data_size);
         }
 
         return ERR_PTR(-EPROTO);
     }
 
-    return datagram->data + EC_MBOX_HEADER_SIZE;
+    return response_data->data + EC_MBOX_HEADER_SIZE;
 }
 
 /*****************************************************************************/

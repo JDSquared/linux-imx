@@ -27,36 +27,52 @@
  *
  *****************************************************************************/
 
-/** \file
- * FoE defines.
- */
-
-#ifndef __FOE_H__
-#define __FOE_H__
+/**
+   \file
+   Abstract locks
+*/
 
 /*****************************************************************************/
 
-/** FoE error enumeration type.
- */
-typedef enum {
-    FOE_BUSY               = 0, /**< Busy. */
-    FOE_READY              = 1, /**< Ready. */
-    FOE_IDLE               = 2, /**< Idle. */
-    FOE_WC_ERROR           = 3, /**< Working counter error. */
-    FOE_RECEIVE_ERROR      = 4, /**< Receive error. */
-    FOE_PROT_ERROR         = 5, /**< Protocol error. */
-    FOE_NODATA_ERROR       = 6, /**< No data error. */
-    FOE_PACKETNO_ERROR     = 7, /**< Packet number error. */
-    FOE_OPCODE_ERROR       = 8, /**< OpCode error. */
-    FOE_TIMEOUT_ERROR      = 9, /**< Timeout error. */
-    FOE_SEND_RX_DATA_ERROR = 10, /**< Error sending received data. */
-    FOE_RX_DATA_ACK_ERROR  = 11, /**< Error acknowledging received data. */
-    FOE_ACK_ERROR          = 12, /**< Acknowledge error. */
-    FOE_MBOX_FETCH_ERROR   = 13, /**< Error fetching data from mailbox. */
-    FOE_READ_NODATA_ERROR  = 14, /**< No data while reading. */
-    FOE_MBOX_PROT_ERROR    = 15, /**< Mailbox protocol error. */
-} ec_foe_error_t;
+#ifndef __EC_LOCKS_H__
+#define __EC_LOCKS_H__
+
+#include "globals.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 27)
+#include <linux/semaphore.h>
+#else
+#include <asm/semaphore.h>
+#endif
+
+/*****************************************************************************/
+
+#ifdef EC_USE_RTMUTEX
+
+typedef struct rt_mutex ec_lock_t;
+
+static inline void ec_lock_init(ec_lock_t *sem) { rt_mutex_init(sem); }
+static inline void ec_lock_down(ec_lock_t *sem) { rt_mutex_lock(sem); }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 34)
+static inline int ec_lock_down_interruptible(ec_lock_t *sem) { return rt_mutex_lock_interruptible(sem); }
+#else
+static inline int ec_lock_down_interruptible(ec_lock_t *sem) { return rt_mutex_lock_interruptible(sem, 1); }
+#endif
+static inline void ec_lock_up(ec_lock_t *sem) { rt_mutex_unlock(sem); }
+
+#else
+
+typedef struct semaphore ec_lock_t;
+
+static inline void ec_lock_init(ec_lock_t *sem) { sema_init(sem, 1); }
+static inline void ec_lock_down(ec_lock_t *sem) { down(sem); }
+static inline int ec_lock_down_interruptible(ec_lock_t *sem) { return down_interruptible(sem); }
+static inline void ec_lock_up(ec_lock_t *sem) { up(sem); }
+
+#endif
 
 /*****************************************************************************/
 
 #endif
+
+/*****************************************************************************/
