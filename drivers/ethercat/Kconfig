@@ -22,6 +22,11 @@ config ETHERCAT_DEBUG_IF
 	depends on ETHERCAT
 	default n
 
+config ETHERCAT_SII_ASSIGN
+	bool "Ethercat master allow SII assignment"
+	depends on ETHERCAT
+	default n
+
 source "drivers/ethercat/devices/Kconfig"
 
 endif # ETHERCAT
